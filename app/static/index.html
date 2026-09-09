@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OCR + Vector Search</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e8eb;
+    --muted: #8b93a1;
+    --accent: #5b8cff;
+    --accent-dim: #2f4a91;
+    --danger: #ff6b6b;
+    --ok: #4ade80;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    padding: 28px 24px 12px;
+    max-width: 960px;
+    margin: 0 auto;
+  }
+  header h1 {
+    font-size: 20px;
+    margin: 0 0 4px;
+    font-weight: 600;
+  }
+  header p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+  }
+  main {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 12px 24px 60px;
+    display: grid;
+    gap: 20px;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 760px) {
+    main { grid-template-columns: 1fr 1fr; align-items: start; }
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .panel h2 {
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 0 0 14px;
+  }
+  .dropzone {
+    border: 1.5px dashed var(--border);
+    border-radius: 10px;
+    padding: 28px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .dropzone.drag {
+    border-color: var(--accent);
+    background: rgba(91,140,255,0.06);
+    color: var(--text);
+  }
+  .dropzone input { display: none; }
+  .preview {
+    margin-top: 14px;
+    display: none;
+  }
+  .preview img {
+    max-width: 100%;
+    max-height: 180px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    display: block;
+    margin: 0 auto;
+  }
+  .filename {
+    text-align: center;
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 8px;
+    word-break: break-all;
+  }
+  button {
+    width: 100%;
+    margin-top: 14px;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .15s, opacity .15s;
+  }
+  button:hover:not(:disabled) { background: #4979eb; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  input[type="text"] {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #0f1115;
+    color: var(--text);
+    font-size: 14px;
+  }
+  input[type="text"]:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .row label { font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .row input[type="number"] {
+    width: 64px;
+    padding: 8px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #0f1115;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .status {
+    margin-top: 12px;
+    font-size: 13px;
+    min-height: 18px;
+  }
+  .status.err { color: var(--danger); }
+  .status.ok { color: var(--ok); }
+  .status.busy { color: var(--muted); }
+  .result-text {
+    margin-top: 12px;
+    padding: 12px;
+    background: #0f1115;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    max-height: 160px;
+    overflow-y: auto;
+    display: none;
+  }
+  .results {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .result-card {
+    display: flex;
+    gap: 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+  }
+  .result-card img {
+    width: 90px;
+    height: 90px;
+    object-fit: cover;
+    border-radius: 6px;
+    background: #0f1115;
+    flex-shrink: 0;
+  }
+  .result-card .body { min-width: 0; flex: 1; }
+  .result-card .meta {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+  .result-card .meta .distance {
+    color: var(--accent);
+    font-family: ui-monospace, monospace;
+  }
+  .result-card .text {
+    font-size: 13px;
+    color: var(--text);
+    line-height: 1.4;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+  }
+  .empty {
+    color: var(--muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 20px;
+    grid-column: 1 / -1;
+  }
+  .section-label {
+    grid-column: 1 / -1;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin: 6px 0 -6px;
+  }
+  .badge {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .badge.text { background: rgba(91,140,255,0.15); color: var(--accent); }
+  .badge.novtext { background: rgba(255,107,107,0.15); color: var(--danger); }
+  .thumb-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    justify-content: center;
+  }
+  .thumb-grid .thumb {
+    width: 52px;
+    height: 52px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    background: #0f1115;
+    flex-shrink: 0;
+  }
+  .thumb-grid .thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .batch-line {
+    padding: 3px 0;
+    font-size: 12px;
+  }
+  .cost-panel {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+  .cost-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .cost-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .cost-dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .cost-dot.off { background: var(--muted); }
+  .cost-status-text {
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .cost-meter {
+    font-size: 12px;
+    color: var(--muted);
+    flex: 1;
+    min-width: 200px;
+  }
+  .cost-meter b { color: var(--text); font-weight: 600; }
+  .cost-buttons { display: flex; gap: 8px; }
+  .cost-buttons button {
+    width: auto;
+    margin-top: 0;
+    padding: 7px 14px;
+    font-size: 12px;
+  }
+  .btn-stop { background: var(--danger) !important; }
+  .btn-stop:hover:not(:disabled) { background: #e85c5c !important; }
+  .btn-secondary { background: var(--border) !important; color: var(--text) !important; }
+  .pending-card .actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .pending-card .actions button {
+    width: auto;
+    margin-top: 0;
+    padding: 6px 12px;
+    font-size: 12px;
+  }
+  .pending-card .fields-preview {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+    max-height: 60px;
+    overflow-y: auto;
+  }
+  .btn-confirm { background: var(--ok) !important; color: #0f1115 !important; }
+  .btn-confirm:hover:not(:disabled) { background: #3fce74 !important; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>OCR + Vector Search</h1>
+  <p>Upload an image to extract and index its text, then search by text or by visual similarity.</p>
+</header>
+
+<div class="cost-panel">
+  <div class="cost-card">
+    <span class="cost-dot" id="cost-dot"></span>
+    <span class="cost-status-text" id="cost-status-text">Checking…</span>
+    <span class="cost-meter" id="cost-meter">—</span>
+    <div class="cost-buttons">
+      <button id="cost-start-btn">Start (deploy)</button>
+      <button id="cost-stop-btn" class="btn-stop">Stop (undeploy)</button>
+      <button id="cost-refresh-btn" class="btn-secondary">Refresh</button>
+    </div>
+  </div>
+</div>
+
+<main>
+
+  <section class="panel">
+    <h2>Ingest</h2>
+    <label class="dropzone" id="dropzone">
+      <span id="dropzone-text">Click to choose images, or drag them here (multiple allowed)</span>
+      <input type="file" id="file-input" accept="image/*" multiple>
+    </label>
+    <div class="preview" id="preview">
+      <div class="thumb-grid" id="thumb-grid"></div>
+      <div class="filename" id="preview-name"></div>
+    </div>
+    <button id="ingest-btn" disabled>Upload &amp; index</button>
+    <div class="status" id="ingest-status"></div>
+    <div class="result-text" id="ingest-text"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Search by text</h2>
+    <input type="text" id="query-input" placeholder="e.g. gold purity 18k" autocomplete="off">
+    <div class="row">
+      <label for="topk-input">Results</label>
+      <input type="number" id="topk-input" value="5" min="1" max="50">
+      <button id="search-btn" style="margin-top:0;">Search</button>
+    </div>
+    <div class="status" id="search-status"></div>
+  </section>
+
+  <div class="section-label">Text search results</div>
+  <div class="results" id="results"></div>
+
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>Search by image (visual similarity)</h2>
+    <label class="dropzone" id="img-dropzone">
+      <span id="img-dropzone-text">Click to choose an image, or drag one here</span>
+      <input type="file" id="img-file-input" accept="image/*">
+    </label>
+    <div class="preview" id="img-preview">
+      <img id="img-preview-img" alt="preview">
+      <div class="filename" id="img-preview-name"></div>
+    </div>
+    <div class="row">
+      <label for="img-topk-input">Results</label>
+      <input type="number" id="img-topk-input" value="5" min="1" max="50">
+      <button id="img-search-btn" style="margin-top:0;" disabled>Find similar images</button>
+    </div>
+    <div class="status" id="img-search-status"></div>
+  </section>
+
+  <div class="section-label">Image similarity results</div>
+  <div class="results" id="img-results"></div>
+
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>Pending from Airtable</h2>
+    <p style="font-size:12px;color:var(--muted);margin:-8px 0 12px;">
+      Records an Airtable Automation notified this app about. Nothing here has been ingested yet — review each one and Confirm or Dismiss.
+    </p>
+    <button id="pending-refresh-btn" class="btn-secondary" style="width:auto;padding:7px 14px;font-size:12px;">Refresh</button>
+    <div class="status" id="pending-status"></div>
+  </section>
+
+  <div class="results" id="pending-results"></div>
+
+</main>
+
+<script>
+const API_BASE = ""; // same origin
+
+// ---------- Cost control panel ----------
+const costDot = document.getElementById("cost-dot");
+const costStatusText = document.getElementById("cost-status-text");
+const costMeter = document.getElementById("cost-meter");
+const costStartBtn = document.getElementById("cost-start-btn");
+const costStopBtn = document.getElementById("cost-stop-btn");
+const costRefreshBtn = document.getElementById("cost-refresh-btn");
+
+async function refreshCostPanel() {
+  try {
+    const [statusRes, usageRes] = await Promise.all([
+      fetch(`${API_BASE}/admin/vector-index/status`),
+      fetch(`${API_BASE}/admin/vector-index/usage`),
+    ]);
+    const status = await statusRes.json();
+    const usage = await usageRes.json();
+
+    const deployed = status.deployed;
+    costDot.className = "cost-dot " + (deployed ? "on" : "off");
+    costStatusText.textContent = deployed ? "Vector index: ONLINE (billing)" : "Vector index: OFFLINE";
+    costMeter.innerHTML = `<b>${usage.total_deployed_hours}</b> hrs deployed all-time &middot; ~<b>$${usage.estimated_cost_usd}</b> estimated (self-tracked, not your real GCP bill)`;
+
+    costStartBtn.disabled = deployed;
+    costStopBtn.disabled = !deployed;
+  } catch (err) {
+    costStatusText.textContent = "Status unavailable";
+    costMeter.textContent = err.message;
+  }
+}
+
+async function costAction(endpoint, btn) {
+  costStartBtn.disabled = true;
+  costStopBtn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = "Working...";
+  try {
+    const res = await fetch(`${API_BASE}${endpoint}`, { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  } catch (err) {
+    alert(`Failed: ${err.message}`);
+  } finally {
+    btn.textContent = original;
+    await refreshCostPanel();
+  }
+}
+
+costStartBtn.addEventListener("click", () => costAction("/admin/vector-index/deploy", costStartBtn));
+costStopBtn.addEventListener("click", () => costAction("/admin/vector-index/undeploy", costStopBtn));
+costRefreshBtn.addEventListener("click", refreshCostPanel);
+
+refreshCostPanel();
+setInterval(refreshCostPanel, 30000); // keep it fresh if the schedule flips state in the background
+
+// ---------- Ingest ----------
+const dropzone = document.getElementById("dropzone");
+const dropzoneText = document.getElementById("dropzone-text");
+const fileInput = document.getElementById("file-input");
+const preview = document.getElementById("preview");
+const thumbGrid = document.getElementById("thumb-grid");
+const previewName = document.getElementById("preview-name");
+const ingestBtn = document.getElementById("ingest-btn");
+const ingestStatus = document.getElementById("ingest-status");
+const ingestText = document.getElementById("ingest-text");
+
+let selectedFiles = [];
+
+function setSelectedFiles(fileList) {
+  const files = Array.from(fileList).filter(f => f.type.startsWith("image/"));
+  if (!files.length) return;
+  selectedFiles = files;
+
+  thumbGrid.innerHTML = files.map(f =>
+    `<div class="thumb"><img src="${URL.createObjectURL(f)}" alt=""></div>`
+  ).join("");
+  previewName.textContent = files.length === 1 ? files[0].name : `${files.length} files selected`;
+  preview.style.display = "block";
+  dropzoneText.textContent = "Choose different images";
+  ingestBtn.disabled = false;
+  ingestBtn.textContent = files.length === 1 ? "Upload & index" : `Upload & index ${files.length} images`;
+  ingestStatus.textContent = "";
+  ingestStatus.className = "status";
+  ingestText.style.display = "none";
+}
+
+fileInput.addEventListener("change", (e) => setSelectedFiles(e.target.files));
+
+dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("drag"); });
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
+dropzone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropzone.classList.remove("drag");
+  if (e.dataTransfer.files.length) setSelectedFiles(e.dataTransfer.files);
+});
+
+ingestBtn.addEventListener("click", async () => {
+  if (!selectedFiles.length) return;
+  const isBatch = selectedFiles.length > 1;
+
+  ingestBtn.disabled = true;
+  ingestStatus.textContent = isBatch
+    ? `Uploading and processing ${selectedFiles.length} images...`
+    : "Uploading and running OCR...";
+  ingestStatus.className = "status busy";
+  ingestText.style.display = "none";
+
+  const form = new FormData();
+
+  try {
+    if (isBatch) {
+      selectedFiles.forEach(f => form.append("files", f));
+      const res = await fetch(`${API_BASE}/ingest/batch`, { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+      const okCount = data.results.filter(r => r.status === "ok").length;
+      const failCount = data.results.length - okCount;
+      ingestStatus.textContent = failCount ? `${okCount} indexed, ${failCount} failed` : `${okCount} indexed`;
+      ingestStatus.className = failCount ? "status err" : "status ok";
+
+      ingestText.innerHTML = data.results.map(r => {
+        if (r.status === "ok") {
+          const badge = r.text_indexed
+            ? `<span class="badge text">text</span>`
+            : `<span class="badge novtext">no text</span>`;
+          return `<div class="batch-line">✓ ${escapeHtml(r.filename)} ${badge}</div>`;
+        }
+        return `<div class="batch-line">✗ ${escapeHtml(r.filename)} — ${escapeHtml(r.detail || "failed")}</div>`;
+      }).join("");
+      ingestText.style.display = "block";
+    } else {
+      form.append("file", selectedFiles[0]);
+      const res = await fetch(`${API_BASE}/ingest`, { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+      const badge = data.text_indexed
+        ? `<span class="badge text">text indexed</span>`
+        : `<span class="badge novtext">no text found — image search only</span>`;
+      ingestStatus.innerHTML = `Indexed as ${data.doc_id} ${badge}`;
+      ingestStatus.className = "status ok";
+      ingestText.textContent = data.ocr_text || "(no text detected)";
+      ingestText.style.display = "block";
+    }
+  } catch (err) {
+    ingestStatus.textContent = `Failed: ${err.message}`;
+    ingestStatus.className = "status err";
+  } finally {
+    ingestBtn.disabled = false;
+  }
+});
+
+// ---------- Search ----------
+const queryInput = document.getElementById("query-input");
+const topkInput = document.getElementById("topk-input");
+const searchBtn = document.getElementById("search-btn");
+const searchStatus = document.getElementById("search-status");
+const resultsEl = document.getElementById("results");
+
+async function runSearch() {
+  const q = queryInput.value.trim();
+  if (!q) return;
+  const topK = topkInput.value || 5;
+
+  searchBtn.disabled = true;
+  searchStatus.textContent = "Searching...";
+  searchStatus.className = "status busy";
+  resultsEl.innerHTML = "";
+
+  try {
+    const url = `${API_BASE}/search?q=${encodeURIComponent(q)}&top_k=${encodeURIComponent(topK)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    searchStatus.textContent = `${data.results.length} result(s)`;
+    searchStatus.className = "status ok";
+    renderResults(resultsEl, data.results, "distance", (v) => `distance ${v.toFixed(4)}`);
+  } catch (err) {
+    searchStatus.textContent = `Failed: ${err.message}`;
+    searchStatus.className = "status err";
+  } finally {
+    searchBtn.disabled = false;
+  }
+}
+
+function renderResults(container, results, scoreKey, formatScore) {
+  if (!results.length) {
+    container.innerHTML = `<div class="empty">No matches.</div>`;
+    return;
+  }
+  container.innerHTML = results.map(r => `
+    <div class="result-card">
+      <img src="${r.image_url}" alt="" onerror="this.style.visibility='hidden'">
+      <div class="body">
+        <div class="meta">
+          <span>${r.doc_id}</span>
+          <span class="distance">${formatScore(r[scoreKey])}</span>
+        </div>
+        <div class="text">${escapeHtml(r.ocr_text) || "<em>(no text detected)</em>"}</div>
+      </div>
+    </div>
+  `).join("");
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+searchBtn.addEventListener("click", runSearch);
+queryInput.addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+
+// ---------- Search by image ----------
+const imgDropzone = document.getElementById("img-dropzone");
+const imgDropzoneText = document.getElementById("img-dropzone-text");
+const imgFileInput = document.getElementById("img-file-input");
+const imgPreview = document.getElementById("img-preview");
+const imgPreviewImg = document.getElementById("img-preview-img");
+const imgPreviewName = document.getElementById("img-preview-name");
+const imgSearchBtn = document.getElementById("img-search-btn");
+const imgSearchStatus = document.getElementById("img-search-status");
+const imgTopkInput = document.getElementById("img-topk-input");
+const imgResultsEl = document.getElementById("img-results");
+
+let selectedImageQueryFile = null;
+
+function setSelectedImageQueryFile(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  selectedImageQueryFile = file;
+  const url = URL.createObjectURL(file);
+  imgPreviewImg.src = url;
+  imgPreviewName.textContent = file.name;
+  imgPreview.style.display = "block";
+  imgDropzoneText.textContent = "Choose a different image";
+  imgSearchBtn.disabled = false;
+  imgSearchStatus.textContent = "";
+  imgSearchStatus.className = "status";
+}
+
+imgFileInput.addEventListener("change", (e) => setSelectedImageQueryFile(e.target.files[0]));
+
+imgDropzone.addEventListener("dragover", (e) => { e.preventDefault(); imgDropzone.classList.add("drag"); });
+imgDropzone.addEventListener("dragleave", () => imgDropzone.classList.remove("drag"));
+imgDropzone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  imgDropzone.classList.remove("drag");
+  if (e.dataTransfer.files.length) setSelectedImageQueryFile(e.dataTransfer.files[0]);
+});
+
+imgSearchBtn.addEventListener("click", async () => {
+  if (!selectedImageQueryFile) return;
+  const topK = imgTopkInput.value || 5;
+
+  imgSearchBtn.disabled = true;
+  imgSearchStatus.textContent = "Embedding image and comparing...";
+  imgSearchStatus.className = "status busy";
+  imgResultsEl.innerHTML = "";
+
+  const form = new FormData();
+  form.append("file", selectedImageQueryFile);
+
+  try {
+    const url = `${API_BASE}/search/image?top_k=${encodeURIComponent(topK)}`;
+    const res = await fetch(url, { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    imgSearchStatus.textContent = `${data.results.length} result(s)`;
+    imgSearchStatus.className = "status ok";
+    renderResults(imgResultsEl, data.results, "similarity", (v) => `similarity ${v.toFixed(4)}`);
+  } catch (err) {
+    imgSearchStatus.textContent = `Failed: ${err.message}`;
+    imgSearchStatus.className = "status err";
+  } finally {
+    imgSearchBtn.disabled = false;
+  }
+});
+
+// ---------- Pending from Airtable ----------
+const pendingResultsEl = document.getElementById("pending-results");
+const pendingStatus = document.getElementById("pending-status");
+const pendingRefreshBtn = document.getElementById("pending-refresh-btn");
+
+async function loadPending() {
+  pendingStatus.textContent = "Loading...";
+  pendingStatus.className = "status busy";
+  try {
+    const res = await fetch(`${API_BASE}/airtable/pending`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    pendingStatus.textContent = data.items.length ? "" : "Nothing pending.";
+    pendingStatus.className = "status";
+    renderPending(data.items);
+  } catch (err) {
+    pendingStatus.textContent = `Failed: ${err.message}`;
+    pendingStatus.className = "status err";
+  }
+}
+
+function renderPending(items) {
+  if (!items.length) {
+    pendingResultsEl.innerHTML = "";
+    return;
+  }
+  pendingResultsEl.innerHTML = items.map(item => {
+    if (item.fetch_error) {
+      return `
+        <div class="result-card pending-card">
+          <div class="body">
+            <div class="meta"><span>${escapeHtml(item.record_id)} &middot; ${escapeHtml(item.table)}</span></div>
+            <div class="text">Could not fetch preview: ${escapeHtml(item.fetch_error)}</div>
+            <div class="actions">
+              <button class="btn-confirm" onclick="confirmPending('${item.record_id}')">Confirm anyway</button>
+              <button class="btn-secondary" onclick="dismissPending('${item.record_id}')">Dismiss</button>
+            </div>
+          </div>
+        </div>`;
+    }
+    const fieldsPreview = Object.entries(item.preview_fields || {})
+      .map(([k, v]) => `<div><b>${escapeHtml(k)}:</b> ${escapeHtml(String(v))}</div>`)
+      .join("");
+    return `
+      <div class="result-card pending-card">
+        <img src="${item.preview_image_url || ''}" alt="" onerror="this.style.visibility='hidden'">
+        <div class="body">
+          <div class="meta"><span>${escapeHtml(item.record_id)} &middot; ${escapeHtml(item.table)}</span></div>
+          <div class="fields-preview">${fieldsPreview || "(no other fields)"}</div>
+          <div class="actions">
+            <button class="btn-confirm" onclick="confirmPending('${item.record_id}')">Confirm &amp; ingest</button>
+            <button class="btn-secondary" onclick="dismissPending('${item.record_id}')">Dismiss</button>
+          </div>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+async function confirmPending(recordId) {
+  pendingStatus.textContent = `Ingesting ${recordId}...`;
+  pendingStatus.className = "status busy";
+  try {
+    const res = await fetch(`${API_BASE}/airtable/pending/${encodeURIComponent(recordId)}/confirm`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    pendingStatus.textContent = `Ingested ${recordId}.`;
+    pendingStatus.className = "status ok";
+  } catch (err) {
+    pendingStatus.textContent = `Failed: ${err.message}`;
+    pendingStatus.className = "status err";
+  } finally {
+    loadPending();
+  }
+}
+
+async function dismissPending(recordId) {
+  try {
+    const res = await fetch(`${API_BASE}/airtable/pending/${encodeURIComponent(recordId)}/dismiss`, { method: "POST" });
+    if (!res.ok) { const data = await res.json(); throw new Error(data.detail || `HTTP ${res.status}`); }
+  } catch (err) {
+    alert(`Failed: ${err.message}`);
+  } finally {
+    loadPending();
+  }
+}
+
+pendingRefreshBtn.addEventListener("click", loadPending);
+loadPending();
+setInterval(loadPending, 30000);
+</script>
+
+</body>
+</html>

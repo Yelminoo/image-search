@@ -1,0 +1,16 @@
+# Secrets
+.env
+.env.local
+service-account.json
+*.json.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
