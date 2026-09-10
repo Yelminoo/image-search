@@ -9,18 +9,20 @@ from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
 from app import (
-    vision_ocr, embeddings, storage, vector_search, metadata_store, similarity,
-    airtable_source, airtable_pending, scheduler, usage_meter,
+    vision_ocr, embeddings, storage, metadata_store, faiss_index,
+    airtable_source, airtable_pending,
 )
 from app.config import settings
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    usage_meter.ensure_baseline(vector_search.is_deployed())
-    scheduler.start()  # no-op unless VECTOR_SEARCH_SCHEDULE_ENABLED=true
+    # Rebuild both in-memory FAISS indexes from Firestore (the durable
+    # source of truth for embeddings) — see app/faiss_index.py. Cheap at
+    # this project's scale (low milliseconds per the CHANGELOG benchmark).
+    faiss_index.text_index.rebuild_from(await asyncio.to_thread(metadata_store.get_all_with_text_embeddings))
+    faiss_index.image_index.rebuild_from(await asyncio.to_thread(metadata_store.get_all_image_embedding_pairs))
     yield
-    scheduler.stop()
 
 
 app = FastAPI(title="OCR + Vector Search (Google Stack)", lifespan=lifespan)
@@ -120,9 +122,12 @@ async def _ingest_one(
     /ingest/airtable:
     1. Upload image to GCS
     2. Run Cloud Vision OCR on it
-    3. Embed the image itself (multimodalembedding@001) for similarity search
-    4. If text was found: embed it with Vertex AI and upsert into Vector Search
-    5. Save the text/URL/image-embedding metadata into Firestore, keyed by doc_id
+    3. Embed the image itself (multimodalembedding@001), store it in
+       Firestore, and upsert it into the in-memory FAISS image index
+    4. If text was found: embed it with Vertex AI, store it in Firestore,
+       and upsert it into the in-memory FAISS text index
+       (both indexes: see app/faiss_index.py)
+    5. Save the text/URL/embedding metadata into Firestore, keyed by doc_id
 
     Images with no detectable text are still ingested and become searchable
     via /search/image — they just won't show up in /search (text) results,
@@ -131,9 +136,9 @@ async def _ingest_one(
 
     doc_id: pass a stable, deterministic id (e.g. derived from an Airtable
     attachment id) to make re-ingesting the same source idempotent —
-    save_metadata()/upsert_vector() both overwrite-in-place on a repeat
-    doc_id rather than creating a duplicate. Omit it (default) to generate
-    a fresh random id, as manual uploads do.
+    save_metadata() and both faiss_index upsert() calls overwrite-in-place
+    on a repeat doc_id rather than creating a duplicate. Omit it (default)
+    to generate a fresh random id, as manual uploads do.
 
     extra_metadata: arbitrary additional fields merged into the Firestore
     document alongside image_embedding — e.g. where a record came from and
@@ -151,16 +156,20 @@ async def _ingest_one(
     ocr_text = ocr_result["full_text"].strip()
 
     image_embedding = embeddings.embed_image(file_bytes)
+    faiss_index.image_index.upsert(doc_id, image_embedding)  # keep the in-memory index in sync immediately
 
     text_indexed = bool(ocr_text)
+    text_embedding = None
     if text_indexed:
         text_embedding = embeddings.embed_document(ocr_text)
-        vector_search.upsert_vector(doc_id, text_embedding)
+        faiss_index.text_index.upsert(doc_id, text_embedding)
 
     # image_url is NOT stored — it would go stale, since signed URLs expire.
     # gcs_uri (permanent) is stored instead; signed URLs are minted fresh
     # from it wherever a response needs one (see _signed_url_for below).
     extra = {"source": "upload", **(extra_metadata or {}), "image_embedding": image_embedding}
+    if text_embedding is not None:
+        extra["text_embedding"] = text_embedding
     metadata_store.save_metadata(doc_id, gcs_uri, "", ocr_text, extra=extra)
 
     return {
@@ -448,26 +457,31 @@ async def dismiss_airtable_pending(record_id: str):
 async def search(q: str, top_k: int = 10):
     """
     1. Embed the query text (query task_type, not document task_type)
-    2. Find nearest neighbors in Vertex AI Vector Search
+    2. Find nearest neighbors via the in-memory FAISS index (app/faiss_index.py)
+       — exact cosine-similarity search, not a deployed/billed service
     3. Look up the matched doc_ids' text/URL in Firestore
+
+    `distance` in the response is kept as the field name for API/UI
+    compatibility with the earlier Vertex-backed version, computed as
+    `1 - cosine_similarity` (so lower still means "closer," same as before).
     """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     query_embedding = embeddings.embed_query(q)
-    neighbors = vector_search.search(query_embedding, top_k=top_k)
+    neighbors = faiss_index.text_index.search(query_embedding, top_k=top_k)  # [(doc_id, similarity), ...]
 
-    doc_ids = [n.id for n in neighbors]
+    doc_ids = [doc_id for doc_id, _ in neighbors]
     metadata = metadata_store.get_metadata_batch(doc_ids)
 
     results = []
-    for n in neighbors:
-        meta = metadata.get(n.id)
+    for doc_id, sim in neighbors:
+        meta = metadata.get(doc_id)
         if not meta:
             continue
         results.append(SearchResult(
-            doc_id=n.id,
-            distance=n.distance,
+            doc_id=doc_id,
+            distance=1.0 - sim,
             image_url=_signed_url_for(meta),
             ocr_text=meta.get("ocr_text", ""),
         ))
@@ -480,28 +494,31 @@ async def search_by_image(file: UploadFile = File(...), top_k: int = 10):
     """
     Visual similarity search — upload an image, get back the most visually
     similar ones already ingested, regardless of what text (if any) they
-    contain. Uses brute-force cosine similarity over embeddings stored in
-    Firestore (see app/similarity.py) rather than a second Vector Search
-    index — fine at small scale, revisit if the collection grows large.
+    contain. FAISS-backed (app/faiss_index.py), same exact-search approach
+    as text search — previously a pure-Python brute-force scan
+    (app/similarity.py, retired, kept in the repo for reference).
     """
     file_bytes = await file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
     query_embedding = embeddings.embed_image(file_bytes)
-    candidates = metadata_store.get_all_with_image_embeddings()
+    neighbors = faiss_index.image_index.search(query_embedding, top_k=top_k)  # [(doc_id, similarity), ...]
 
-    top = similarity.search_similar_images(query_embedding, candidates, top_k=top_k)
+    doc_ids = [doc_id for doc_id, _ in neighbors]
+    metadata = metadata_store.get_metadata_batch(doc_ids)
 
-    results = [
-        ImageSearchResult(
-            doc_id=c["doc_id"],
-            similarity=c["similarity"],
-            image_url=_signed_url_for(c),
-            ocr_text=c.get("ocr_text", ""),
-        )
-        for c in top
-    ]
+    results = []
+    for doc_id, sim in neighbors:
+        meta = metadata.get(doc_id)
+        if not meta:
+            continue
+        results.append(ImageSearchResult(
+            doc_id=doc_id,
+            similarity=sim,
+            image_url=_signed_url_for(meta),
+            ocr_text=meta.get("ocr_text", ""),
+        ))
     return ImageSearchResponse(results=results)
 
 
@@ -510,51 +527,17 @@ async def health():
     return {"status": "ok"}
 
 
-# --- Vector Search index cost control -------------------------------------
-# Manual override for the scheduled deploy/undeploy in app/scheduler.py.
-# Useful outside the configured schedule (e.g. an unscheduled late-night
-# test session) or when VECTOR_SEARCH_SCHEDULE_ENABLED is off entirely.
-#
-# WARNING: unlike every other endpoint in this API, these directly control
-# real hourly billing (deploy_index) and search availability (undeploy_index
-# breaks /search until redeployed). This API has no auth on ANY endpoint
-# (a known, documented gap) — that's a bigger deal here than on /ingest or
-# /search, since anyone who can reach these can run up your bill or take
-# text search offline. Put these behind auth before exposing this API
-# beyond localhost.
-
-@app.get("/admin/vector-index/status")
-async def vector_index_status():
-    deployed = await asyncio.to_thread(vector_search.is_deployed)
-    return {"deployed": deployed}
-
-
-@app.post("/admin/vector-index/deploy")
-async def vector_index_deploy():
-    # deploy_index()/undeploy_index() are synchronous SDK calls that can
-    # block for minutes (redeploying isn't instant even though the index
-    # itself already exists) — offloaded to a thread so they don't freeze
-    # the whole app (every other request, including /search) meanwhile.
-    started = await asyncio.to_thread(vector_search.deploy_index)
-    if started:
-        await asyncio.to_thread(usage_meter.record_event, "deploy")
-    return {"deployed": True, "action_taken": started}
-
-
-@app.post("/admin/vector-index/undeploy")
-async def vector_index_undeploy():
-    stopped = await asyncio.to_thread(vector_search.undeploy_index)
-    if stopped:
-        await asyncio.to_thread(usage_meter.record_event, "undeploy")
-    return {"deployed": False, "action_taken": stopped}
-
-
-@app.get("/admin/vector-index/usage")
-async def vector_index_usage():
+@app.get("/admin/faiss-index/status")
+async def faiss_index_status():
     """
-    Self-tracked usage meter — NOT a live GCP billing lookup, just this
-    app's own log of deploy/undeploy events turned into an hours + rough
-    cost estimate. See app/usage_meter.py for exactly what it does and
-    doesn't capture.
+    Sanity-check endpoint for the in-memory FAISS indexes — how many
+    documents each currently holds. (The old /admin/vector-index/*
+    endpoints for the retired Vertex AI Vector Search endpoint are gone
+    along with it — see app/vector_search.py, app/scheduler.py,
+    app/usage_meter.py, kept in the repo but no longer wired in, and
+    CHANGELOG.md for why.)
     """
-    return await asyncio.to_thread(usage_meter.compute_usage)
+    return {
+        "text_documents_indexed": faiss_index.text_index.size(),
+        "image_documents_indexed": faiss_index.image_index.size(),
+    }

@@ -327,14 +327,9 @@
 
 <div class="cost-panel">
   <div class="cost-card">
-    <span class="cost-dot" id="cost-dot"></span>
-    <span class="cost-status-text" id="cost-status-text">Checking…</span>
+    <span class="cost-dot on"></span>
+    <span class="cost-status-text">Text index: in-process (FAISS) — no deployed infra, $0</span>
     <span class="cost-meter" id="cost-meter">—</span>
-    <div class="cost-buttons">
-      <button id="cost-start-btn">Start (deploy)</button>
-      <button id="cost-stop-btn" class="btn-stop">Stop (undeploy)</button>
-      <button id="cost-refresh-btn" class="btn-secondary">Refresh</button>
-    </div>
   </div>
 </div>
 
@@ -406,58 +401,24 @@
 <script>
 const API_BASE = ""; // same origin
 
-// ---------- Cost control panel ----------
-const costDot = document.getElementById("cost-dot");
-const costStatusText = document.getElementById("cost-status-text");
+// ---------- Index status bar ----------
+// Text search runs on an in-process FAISS index now -- no deployed/billed
+// infra to start or stop (see CHANGELOG.md). This just shows the live
+// document count as a sanity check that ingests are actually landing in it.
 const costMeter = document.getElementById("cost-meter");
-const costStartBtn = document.getElementById("cost-start-btn");
-const costStopBtn = document.getElementById("cost-stop-btn");
-const costRefreshBtn = document.getElementById("cost-refresh-btn");
 
-async function refreshCostPanel() {
+async function refreshIndexStatus() {
   try {
-    const [statusRes, usageRes] = await Promise.all([
-      fetch(`${API_BASE}/admin/vector-index/status`),
-      fetch(`${API_BASE}/admin/vector-index/usage`),
-    ]);
-    const status = await statusRes.json();
-    const usage = await usageRes.json();
-
-    const deployed = status.deployed;
-    costDot.className = "cost-dot " + (deployed ? "on" : "off");
-    costStatusText.textContent = deployed ? "Vector index: ONLINE (billing)" : "Vector index: OFFLINE";
-    costMeter.innerHTML = `<b>${usage.total_deployed_hours}</b> hrs deployed all-time &middot; ~<b>$${usage.estimated_cost_usd}</b> estimated (self-tracked, not your real GCP bill)`;
-
-    costStartBtn.disabled = deployed;
-    costStopBtn.disabled = !deployed;
+    const res = await fetch(`${API_BASE}/admin/faiss-index/status`);
+    const data = await res.json();
+    costMeter.innerHTML = `<b>${data.documents_indexed}</b> document(s) currently in the text search index`;
   } catch (err) {
-    costStatusText.textContent = "Status unavailable";
-    costMeter.textContent = err.message;
+    costMeter.textContent = `Status unavailable: ${err.message}`;
   }
 }
 
-async function costAction(endpoint, btn) {
-  costStartBtn.disabled = true;
-  costStopBtn.disabled = true;
-  const original = btn.textContent;
-  btn.textContent = "Working...";
-  try {
-    const res = await fetch(`${API_BASE}${endpoint}`, { method: "POST" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  } catch (err) {
-    alert(`Failed: ${err.message}`);
-  } finally {
-    btn.textContent = original;
-    await refreshCostPanel();
-  }
-}
-
-costStartBtn.addEventListener("click", () => costAction("/admin/vector-index/deploy", costStartBtn));
-costStopBtn.addEventListener("click", () => costAction("/admin/vector-index/undeploy", costStopBtn));
-costRefreshBtn.addEventListener("click", refreshCostPanel);
-
-refreshCostPanel();
-setInterval(refreshCostPanel, 30000); // keep it fresh if the schedule flips state in the background
+refreshIndexStatus();
+setInterval(refreshIndexStatus, 30000);
 
 // ---------- Ingest ----------
 const dropzone = document.getElementById("dropzone");

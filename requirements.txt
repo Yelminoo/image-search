@@ -9,3 +9,5 @@ python-multipart==0.0.9
 pydantic==2.9.2
 requests==2.34.2
 apscheduler==3.11.3
+numpy==2.5.2
+faiss-cpu==1.15.0

@@ -1,10 +1,12 @@
-# OCR + Semantic Search — Full Google Stack
+# OCR + Semantic Search — Google Stack + FAISS
 
-Cloud Vision (OCR) → Vertex AI (embeddings) → Vertex AI Vector Search (nearest-neighbor search), with Firestore holding the text/metadata side-table and GCS holding the raw images.
+Cloud Vision (OCR) → Vertex AI (text + image embeddings) → in-process FAISS search, with Firestore holding metadata + embeddings (the durable source of truth) and GCS holding the raw images.
+
+**Both text search and image similarity search run as separate in-memory FAISS indexes inside this app** — there is no separately deployed/billed search infrastructure. See "Why no deployed Vector Search" below for how this evolved and why.
 
 ## Why this shape
 
-Vertex AI Vector Search only stores vector IDs and the vectors themselves — no text, no URLs. So every vector needs a matching row in Firestore, keyed by the same `doc_id`, to get the human-readable content back after a search hit.
+Firestore is the only durable store here — for text/metadata (as usual) *and* for every embedding (text + image). FAISS's index lives entirely in this app's memory and is rebuilt from Firestore once at startup (see `app/faiss_index.py`), so there's no separate index file to manage and no risk of the search index and the metadata drifting out of sync — Firestore is always the truth, FAISS is just a fast, disposable, rebuildable view over it.
 
 ## One-time GCP setup
 
@@ -12,56 +14,16 @@ Vertex AI Vector Search only stores vector IDs and the vectors themselves — no
 2. Enable these APIs: Cloud Vision API, Vertex AI API, Cloud Storage, Firestore.
 3. Create a GCS bucket for images.
 4. Create a Firestore database (Native mode) in the same project.
-5. Create a service account with roles: `Cloud Vision AI User`, `Vertex AI User`, `Storage Object Admin`, `Cloud Datastore User`. Download its JSON key.
+5. Create a service account with roles: `Vertex AI User`, `Storage Object Admin` (or `objectCreator` for least-privilege), `Cloud Datastore User`. Download its JSON key. (No dedicated IAM role is needed for Cloud Vision API itself — access is gated by the API being enabled + valid credentials from the project, not a resource-level role.)
 6. Copy `.env.example` to `.env` and fill in your project ID, bucket name, and the path to the service account key.
 
-## Deploy the vector index (one-time, ~20-60 min)
-
+There is **no infrastructure deployment step** beyond this — no vector index to build, no endpoint to deploy, nothing that bills by the hour. Install deps and run:
 ```bash
 pip install -r requirements.txt
-python setup_vector_index.py
-```
-
-Copy the printed `VERTEX_INDEX_ID` and `VERTEX_INDEX_ENDPOINT_ID` into your `.env`.
-
-**Note:** Vertex AI Vector Search bills for the deployed endpoint by the hour, whether or not you're querying it. Undeploy it when not in active use if cost matters — see "Cost control" below for a scheduled or manual way to do that.
-
-## Cost control — deploy/undeploy on a schedule
-
-The Vector Search endpoint is the one real ongoing cost in this stack (everything else is free-tier or fractions of a cent at normal usage) — it bills hourly for simply being deployed, independent of query volume. Two ways to control that:
-
-**Manual switch, from the web UI** — the bar at the top of `http://localhost:8000/` shows live status (online/offline dot), the usage meter, and Start/Stop buttons. No curl needed for day-to-day use.
-
-**Manual, via API:**
-```bash
-curl -X POST http://localhost:8000/admin/vector-index/undeploy   # stop billing
-curl -X POST http://localhost:8000/admin/vector-index/deploy     # bring it back (fast — the index itself already exists, no rebuild)
-curl http://localhost:8000/admin/vector-index/status             # check current state
-curl http://localhost:8000/admin/vector-index/usage              # hours deployed + estimated cost (see meter caveat below)
-```
-
-**Usage meter:** `/admin/vector-index/usage` (and the web UI bar) shows cumulative deployed-hours and an estimated dollar cost. This is **self-tracked, not a real GCP billing lookup** — it works by logging every deploy/undeploy *this app* performs to Firestore and summing the deployed duration between them, then multiplying by `VECTOR_SEARCH_HOURLY_RATE_ESTIMATE_USD`. It also can't see the very first deploy from `setup_vector_index.py` (run outside this app) — it seeds a synthetic starting point at whenever this app first started tracking, so hours before that aren't counted. Treat the number as a ballpark for "is this thing costing me money right now," not an invoice.
-
-**On the rate itself:** the default was originally an unconfirmed third-party guess of $0.077/hr for a small `e2-standard-2` machine — turned out to be way off. Updated 2026-09-07 to **$0.87/hr**, derived from a real observed charge (200 THB for 7 hours deployed). `setup_vector_index.py` never specifies a `machine_type` or replica count, so Vertex deployed it with "automatic resources" — evidently sized considerably larger/more redundant than that original guess assumed. $0.87/hr is still just one data point, not a guaranteed rate — if you get another real bill, compare it and update `VECTOR_SEARCH_HOURLY_RATE_ESTIMATE_USD` again if it's drifted. At $0.87/hr, leaving the endpoint deployed continuously runs **~$21/day, ~$625/month** — a much stronger case for keeping it undeployed by default and only starting it while actively testing (see the Start/Stop controls above).
-
-**Automatic, in-process schedule** (e.g. business hours only): set in `.env`:
-```env
-VECTOR_SEARCH_SCHEDULE_ENABLED=true
-VECTOR_SEARCH_DEPLOY_CRON=0 9 * * 1-5     # 9am Mon-Fri
-VECTOR_SEARCH_UNDEPLOY_CRON=0 18 * * 1-5  # 6pm Mon-Fri
-VECTOR_SEARCH_SCHEDULE_TIMEZONE=Asia/Singapore
-```
-**This only runs while the `uvicorn` process itself is alive** — stopping the app between sessions means nothing undeploys/redeploys on your behalf, and the index sits in whatever state it was last left in. It's a convenience for a continuously-running deployment, not a substitute for an external scheduler (Cloud Scheduler + a small Cloud Function calling the same deploy/undeploy) if you need the schedule to hold regardless of whether this app happens to be running.
-
-**Security note:** the `/admin/vector-index/*` endpoints have no auth, same as every other endpoint in this API (see "Known gaps" below) — but unlike `/ingest` or `/search`, these directly control real billing and can take text search offline. Put them behind auth before exposing this API beyond localhost.
-
-## Run the API
-
-```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-A web UI is served at `http://localhost:8000/` — upload, text search, and image similarity search, all from the browser. `/docs` still gives you FastAPI's interactive Swagger UI if you'd rather hit the routes directly.
+A web UI is served at `http://localhost:8000/` — upload, text search, and image similarity search, all from the browser. `/docs` gives you FastAPI's interactive Swagger UI if you'd rather hit the routes directly.
 
 ## Use it
 
@@ -98,7 +60,7 @@ curl -X POST "http://localhost:8000/ingest/airtable"
 ```
 Requires `AIRTABLE_API_KEY` / `AIRTABLE_BASE_ID` / `AIRTABLE_TABLE_NAME` set in `.env` first. Optional query params: `?table=...` / `?view=...` / `?limit=5` to override the `.env` defaults for one-off runs, and `?dry_run=true` to preview what would be ingested (record/field/attachment detection) without actually calling Vision/Vertex/GCS. Safe to re-run any time — it's idempotent, keyed by Airtable's own attachment ID, so a repeat run updates existing docs instead of duplicating them. Every other field on each Airtable record (title, tags, description, whatever your base has) is auto-detected and stored alongside the image as metadata — no need to tell it which fields matter.
 
-**Every Airtable-sourced ingest writes results back onto the source record** — `AIRTABLE_WRITE_OCR_TEXT_FIELD` / `AIRTABLE_WRITE_INDEXED_FIELD` / `AIRTABLE_WRITE_DOC_ID_FIELD` in `.env` (default field names: "OCR Text", "Indexed", "Doc ID") must already exist in your base with a compatible type (long text / checkbox / single line text respectively) — this app doesn't create fields for you. Write-back is best-effort: if a field is missing or the wrong type, that one write fails with a message in the response's `detail`, but the ingest itself (GCS/Firestore/Vertex) still succeeded — it's not rolled back.
+**Every Airtable-sourced ingest writes results back onto the source record** — `AIRTABLE_WRITE_OCR_TEXT_FIELD` / `AIRTABLE_WRITE_INDEXED_FIELD` / `AIRTABLE_WRITE_DOC_ID_FIELD` in `.env` (default field names: "OCR Text", "Indexed", "Doc ID") must already exist in your base with a compatible type (long text / checkbox / single line text respectively) — this app doesn't create fields for you. Write-back is best-effort: if a field is missing or the wrong type, that one write fails with a message in the response's `detail`, but the ingest itself (GCS/Firestore/search-index) still succeeded — it's not rolled back.
 
 ## Airtable webhook — notify-only, you confirm before anything ingests
 
@@ -121,24 +83,55 @@ curl -X POST http://localhost:8000/airtable/pending/recXXXXXXXXXXXXXX/dismiss   
 
 Confirming re-fetches the record fresh from Airtable (rather than trusting anything cached from when the webhook fired) — Airtable's attachment URLs expire, so this avoids acting on a stale link if you don't get to reviewing something right away.
 
+## Why no deployed Vector Search (and the FAISS switch)
+
+This project originally used **Vertex AI Vector Search** (a deployed, hourly-billed ANN index) for text search. It was replaced after a real charge — **200 THB for 7 hours deployed, ≈$0.87/hour** — turned out to be ~11x higher than an initial estimate, and would run **~$150/month even limited to business hours, ~$625/month if left running continuously**. Full reasoning and the benchmark that informed the replacement are in `CHANGELOG.md`.
+
+**What replaced it:** every embedding (text *and* image) is stored as a plain field on its Firestore document. At app startup, `app/faiss_index.py` builds two in-memory FAISS `IndexFlatIP` indexes — one 768-dim (`text_index`, from `text_embedding`) and one 1408-dim (`image_index`, from `image_embedding`), separate vector spaces, never compared against each other. This is **exact** search (mathematically identical to brute-force cosine similarity, just computed via optimized BLAS/SIMD instead of a Python loop), not an approximation. New ingests call `upsert()` on the relevant index(es) to stay current without a restart.
+
+**Cost:** $0 for search infrastructure, on both text and image search. What's left is only the same fractions-of-a-cent per-call OCR/embedding cost that was already negligible.
+
+**The trade-off:** both FAISS indexes are in-memory and rebuilt from Firestore on every process restart — cheap at this project's scale (see the benchmark below), but means a restart briefly has empty indexes until the rebuild completes (milliseconds in practice).
+
+**Benchmark that informed the decision** (768-dim vectors matching `text-embedding-004`, top-10 query, run on real hardware — see `CHANGELOG.md` for the full write-up):
+
+| Docs | Pure Python loop | Numpy (vectorized) | FAISS (`IndexFlatIP`, exact) |
+|---|---|---|---|
+| 100 | 8.3 ms | 0.01 ms | 0.04 ms |
+| 1,000 | 92 ms | 0.12 ms | 1.2 ms |
+| 10,000 | 937 ms | 1.0 ms | 20 ms |
+| 100,000 | 10.0 s | 11.7 ms | 133 ms |
+
+All three produce identical results at every scale — the only differentiator is speed, and FAISS/numpy both comfortably outperform a naive Python loop by orders of magnitude.
+
+**Retired, not deleted:** `app/vector_search.py`, `app/scheduler.py`, `app/usage_meter.py`, and `setup_vector_index.py` are still in the repo (in case you want to look back at how the deployed-endpoint approach worked, or reintroduce it at a much larger scale) but are no longer imported or called from `main.py`. The `/admin/vector-index/*` endpoints and the cost-control web UI panel they backed are gone along with them — replaced by a single `GET /admin/faiss-index/status` (returns how many documents are currently indexed) since there's no deployed resource left to manage or meter.
+
+**Existing data / backfill:** text embeddings used to go straight to Vertex Vector Search and were never stored in Firestore, so documents ingested before this switch have `ocr_text` but no `text_embedding` — invisible to the new FAISS-backed `/search` until backfilled. Run once, as needed:
+```bash
+python backfill_text_embeddings.py
+```
+Re-embeds each such document's already-stored `ocr_text` (no re-upload, no re-OCR) and writes `text_embedding` onto the existing Firestore document. Restart the app afterward (or wait for the next restart) to pick the new embeddings up into the FAISS index.
+
 ## Notes on quality
 
 - `DOCUMENT_TEXT_DETECTION` (used here) works better than `TEXT_DETECTION` for both dense text (scans) and sparse text (labels) — no reason to switch.
 - `text-embedding-004` uses different `task_type` hints for storage vs. query (`RETRIEVAL_DOCUMENT` vs `RETRIEVAL_QUERY`) — this is already wired in and meaningfully improves recall over using the same type for both.
 - Image URLs in every response are **signed URLs** (`storage.generate_signed_url()`), not plain public links — Public Access Prevention is enforced on this project, which blocks making the bucket/objects public at all. Signed URLs are minted fresh at response time (they expire, 60 min by default) from the permanent `gcs_uri` stored in Firestore — never store a signed URL itself, it'll go stale. Requires `GOOGLE_APPLICATION_CREDENTIALS` to point at an actual service account JSON key (not ambient/impersonated credentials), since signing happens locally with that key's private key.
+- `/search`'s `distance` field is kept (rather than renamed to `similarity`, like `/search/image` uses) for API/UI compatibility with the earlier Vertex-backed version — it's computed as `1 - cosine_similarity`, so lower still means "closer," same meaning as before.
 
 ## Airtable as source, GCS as working copy
 
-If your images originate in Airtable, `/ingest/airtable` still uploads a full copy of each one into GCS rather than referencing the Airtable attachment URL directly — this is deliberate, not an oversight. Airtable's own attachment URLs expire a couple hours after being returned by the API, so they can't be stored long-term as a stable pointer the way `gcs_uri` is; anything durable (OCR, embeddings, signed-URL previews weeks later) needs a copy that isn't going to 404. The GCS copy is genuinely a second copy of the bytes, not just metadata — worth knowing if storage cost ever becomes a concern. Also worth knowing: `doc_id` is derived from the Airtable *attachment's* own id, not the record id. Replacing an attachment in Airtable (delete + re-upload) gets a new attachment id, so re-running `/ingest/airtable` correctly ingests the new image as a new doc — but the old doc (GCS copy, Firestore row, and its entry in the Vertex text index if it had one) is never cleaned up. There's no delete/orphan-detection path here yet; add one if attachments get replaced often enough for that to matter.
+If your images originate in Airtable, `/ingest/airtable` still uploads a full copy of each one into GCS rather than referencing the Airtable attachment URL directly — this is deliberate, not an oversight. Airtable's own attachment URLs expire a couple hours after being returned by the API, so they can't be stored long-term as a stable pointer the way `gcs_uri` is; anything durable (OCR, embeddings, signed-URL previews weeks later) needs a copy that isn't going to 404. The GCS copy is genuinely a second copy of the bytes, not just metadata — worth knowing if storage cost ever becomes a concern. Also worth knowing: `doc_id` is derived from the Airtable *attachment's* own id, not the record id. Replacing an attachment in Airtable (delete + re-upload) gets a new attachment id, so re-running `/ingest/airtable` correctly ingests the new image as a new doc — but the old doc (GCS copy, Firestore row, and its entries in the FAISS indexes) is never cleaned up. There's no delete/orphan-detection path here yet; add one if attachments get replaced often enough for that to matter.
 
 ## Image similarity search (`/search/image`)
 
-Text search only ever matches on OCR'd text — it has no idea what an image *looks* like. `/search/image` covers that: every ingested image also gets embedded with Vertex AI's `multimodalembedding@001` (1408-dim, a different vector space than the text embeddings, so it's never compared against them), stored as a field on that document's Firestore row.
+Text search only ever matches on OCR'd text — it has no idea what an image *looks* like. `/search/image` covers that: every ingested image also gets embedded with Vertex AI's `multimodalembedding@001` (1408-dim, a different vector space than the text embeddings, so it's compared only against `faiss_index.image_index`, never `text_index`).
 
-Deliberately **not** backed by a second Vertex AI Vector Search index — that would mean a second deployed endpoint billing hourly on top of the text one. Instead, `/search/image` does a brute-force cosine-similarity scan over every stored image embedding in Firestore (see `app/similarity.py`). Fine up to a few thousand images; degrades linearly past that. If you outgrow it, stand up a second index the same way `setup_vector_index.py` does for text, and swap `app/similarity.py`'s linear scan for a `vector_search.search()`-style call against it — the embedding step (`embeddings.embed_image`) doesn't need to change.
+Also FAISS-backed, same as text search (`app/faiss_index.py`'s `image_index`) — verified to return byte-identical similarity scores to the pure-Python brute-force scan (`app/similarity.py`) it replaced, tested live against real ingested images before the switch. `app/similarity.py` is retired, kept in the repo for reference, no longer called.
 
 ## Known gaps to fill in before production
 
 - No auth on the FastAPI endpoints — add an API key or IAM-based auth in front.
 - No retry/backoff around the Vision/Vertex calls — add for production traffic.
-- `distance` from Vector Search is cosine distance, not a 0-1 similarity score — invert/normalize if you want to show a "match %" to users.
+- Both FAISS indexes are in-memory only, rebuilt from Firestore on every restart — fine at this project's scale (see the benchmark above), but means a brief empty-index window right after a restart, and no persistence across process crashes beyond what Firestore already holds.
+- No delete endpoint for either GCS objects or Firestore docs — see "Airtable as source" above for where this bites (orphaned docs from replaced Airtable attachments).
