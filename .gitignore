@@ -11,6 +11,10 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Local data (SQLite metadata store — see app/metadata_store.py)
+local_data.db
+local_data.db-journal
+
 # OS
 .DS_Store
 Thumbs.db

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Search</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+
+<header>
+  <div class="nav-row">
+    <h1>OCR + Vector Search</h1>
+    <nav>
+      <a href="/ingest">Ingest</a>
+      <a href="/search" class="active">Search</a>
+      <button id="logout-btn" class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px;margin-top:0;">Log out</button>
+    </nav>
+  </div>
+  <p>Search by text or by visual similarity.</p>
+</header>
+
+<div class="cost-panel">
+  <div class="cost-card">
+    <span class="cost-dot on"></span>
+    <span class="cost-status-text">Text index: in-process (FAISS) — no deployed infra, $0</span>
+    <span class="cost-meter" id="cost-meter">—</span>
+  </div>
+</div>
+
+<main>
+
+  <section class="panel">
+    <h2>Search by text</h2>
+    <input type="text" id="query-input" placeholder="e.g. gold purity 18k" autocomplete="off">
+    <div class="row">
+      <label for="topk-input">Results</label>
+      <input type="number" id="topk-input" value="5" min="1" max="50">
+      <button id="search-btn" style="margin-top:0;">Search</button>
+    </div>
+    <div class="status" id="search-status"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Search by image (visual similarity)</h2>
+    <label class="dropzone" id="img-dropzone">
+      <span id="img-dropzone-text">Click to choose an image, or drag one here</span>
+      <input type="file" id="img-file-input" accept="image/*">
+    </label>
+    <div class="preview" id="img-preview">
+      <img id="img-preview-img" alt="preview">
+      <div class="filename" id="img-preview-name"></div>
+    </div>
+    <div class="row">
+      <label for="img-topk-input">Results</label>
+      <input type="number" id="img-topk-input" value="5" min="1" max="50">
+      <button id="img-search-btn" style="margin-top:0;" disabled>Find similar images</button>
+    </div>
+    <div class="status" id="img-search-status"></div>
+  </section>
+
+  <div class="section-label">Text search results</div>
+  <div class="results" id="results"></div>
+
+  <div class="section-label">Image similarity results</div>
+  <div class="results" id="img-results"></div>
+
+</main>
+
+<script src="/static/common.js"></script>
+<script>
+// ---------- Search by text ----------
+const queryInput = document.getElementById("query-input");
+const topkInput = document.getElementById("topk-input");
+const searchBtn = document.getElementById("search-btn");
+const searchStatus = document.getElementById("search-status");
+const resultsEl = document.getElementById("results");
+
+async function runSearch() {
+  const q = queryInput.value.trim();
+  if (!q) return;
+  const topK = topkInput.value || 5;
+
+  searchBtn.disabled = true;
+  searchStatus.textContent = "Searching...";
+  searchStatus.className = "status busy";
+  resultsEl.innerHTML = "";
+
+  try {
+    const url = `${API_BASE}/api/search?q=${encodeURIComponent(q)}&top_k=${encodeURIComponent(topK)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    searchStatus.textContent = `${data.results.length} result(s)`;
+    searchStatus.className = "status ok";
+    renderResults(resultsEl, data.results, "distance", (v) => `distance ${v.toFixed(4)}`);
+  } catch (err) {
+    searchStatus.textContent = `Failed: ${err.message}`;
+    searchStatus.className = "status err";
+  } finally {
+    searchBtn.disabled = false;
+  }
+}
+
+function renderResults(container, results, scoreKey, formatScore) {
+  if (!results.length) {
+    container.innerHTML = `<div class="empty">No matches.</div>`;
+    return;
+  }
+  container.innerHTML = results.map(r => {
+    const fieldsHtml = renderFieldsPreview(r.fields);
+    return `
+    <div class="result-card">
+      <img src="${r.image_url}" alt="" onerror="this.style.visibility='hidden'">
+      <div class="body">
+        <div class="meta">
+          <span>${r.doc_id}</span>
+          <span class="distance">${formatScore(r[scoreKey])}</span>
+        </div>
+        <div class="text">${escapeHtml(r.ocr_text) || "<em>(no OCR text)</em>"}</div>
+        ${fieldsHtml}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+searchBtn.addEventListener("click", runSearch);
+queryInput.addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+
+// ---------- Search by image ----------
+const imgDropzone = document.getElementById("img-dropzone");
+const imgDropzoneText = document.getElementById("img-dropzone-text");
+const imgFileInput = document.getElementById("img-file-input");
+const imgPreview = document.getElementById("img-preview");
+const imgPreviewImg = document.getElementById("img-preview-img");
+const imgPreviewName = document.getElementById("img-preview-name");
+const imgSearchBtn = document.getElementById("img-search-btn");
+const imgSearchStatus = document.getElementById("img-search-status");
+const imgTopkInput = document.getElementById("img-topk-input");
+const imgResultsEl = document.getElementById("img-results");
+
+let selectedImageQueryFile = null;
+
+function setSelectedImageQueryFile(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  selectedImageQueryFile = file;
+  const url = URL.createObjectURL(file);
+  imgPreviewImg.src = url;
+  imgPreviewName.textContent = file.name;
+  imgPreview.style.display = "block";
+  imgDropzoneText.textContent = "Choose a different image";
+  imgSearchBtn.disabled = false;
+  imgSearchStatus.textContent = "";
+  imgSearchStatus.className = "status";
+}
+
+imgFileInput.addEventListener("change", (e) => setSelectedImageQueryFile(e.target.files[0]));
+
+imgDropzone.addEventListener("dragover", (e) => { e.preventDefault(); imgDropzone.classList.add("drag"); });
+imgDropzone.addEventListener("dragleave", () => imgDropzone.classList.remove("drag"));
+imgDropzone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  imgDropzone.classList.remove("drag");
+  if (e.dataTransfer.files.length) setSelectedImageQueryFile(e.dataTransfer.files[0]);
+});
+
+imgSearchBtn.addEventListener("click", async () => {
+  if (!selectedImageQueryFile) return;
+  const topK = imgTopkInput.value || 5;
+
+  imgSearchBtn.disabled = true;
+  imgSearchStatus.textContent = "Embedding image and comparing...";
+  imgSearchStatus.className = "status busy";
+  imgResultsEl.innerHTML = "";
+
+  const form = new FormData();
+  form.append("file", selectedImageQueryFile);
+
+  try {
+    const url = `${API_BASE}/search/image?top_k=${encodeURIComponent(topK)}`;
+    const res = await fetch(url, { method: "POST", body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    imgSearchStatus.textContent = `${data.results.length} result(s)`;
+    imgSearchStatus.className = "status ok";
+    renderResults(imgResultsEl, data.results, "similarity", (v) => `similarity ${v.toFixed(4)}`);
+  } catch (err) {
+    imgSearchStatus.textContent = `Failed: ${err.message}`;
+    imgSearchStatus.className = "status err";
+  } finally {
+    imgSearchBtn.disabled = false;
+  }
+});
+</script>
+
+</body>
+</html>

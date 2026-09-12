@@ -27,7 +27,7 @@ def _get_client() -> firestore.Client:
     return _client
 
 
-def add_pending(record_id: str, table: str, raw_payload: dict) -> None:
+def add_pending(record_id: str, base_id: str, table: str, raw_payload: dict) -> None:
     """
     Record a notification. Keyed by record_id — a repeat webhook ping for
     the same record (e.g. edited again before being reviewed) refreshes
@@ -35,6 +35,7 @@ def add_pending(record_id: str, table: str, raw_payload: dict) -> None:
     """
     _get_client().collection(COLLECTION).document(record_id).set({
         "record_id": record_id,
+        "base_id": base_id,
         "table": table,
         "status": "pending",
         "received_at": firestore.SERVER_TIMESTAMP,

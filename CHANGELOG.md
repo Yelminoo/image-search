@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-09-12 (later same day) — Login gate + split Ingest/Search pages
+
+**Status:** implemented and verified live (full login → protected-page → logout cycle tested against the running server, not just unit-level).
+
+**What changed:**
+- `app/auth.py` (new) — single hardcoded account (`ADMIN_EMAIL`/`ADMIN_PASSWORD` in `.env`, never committed — `.env.example` only has placeholders), in-memory session tokens (12hr TTL), constant-time credential comparison via `hmac.compare_digest`. Closes the "no auth on any endpoint" gap flagged since the start of this project — a real, not just noted, security boundary now.
+- `AuthMiddleware` in `main.py` — every request needs a valid session cookie except `/login`, `/auth/login`, `/health`, `/static/*`, and the OpenAPI docs. Browser navigation (`Accept: text/html`) to a protected page redirects to `/login?next=<path>`; API calls get a plain `401 {"detail": "Not authenticated"}` instead — verified both paths behave differently as intended.
+- `app/static/login.html` (new) — email/password form, posts to `/auth/login`, redirects to `?next=` (or `/ingest`) on success.
+- **Split the single combined page into `/ingest` and `/search`**, each its own file (`app/static/ingest.html`, `app/static/search.html`), sharing `common.css`/`common.js` (extracted: `escapeHtml`, `formatFieldValue`, `renderFieldsPreview`, the top status bar, logout button wiring). `/` now redirects to `/ingest`. The old combined `index.html` is deleted, not kept around — it would have been a stale, broken duplicate reachable at `/static/index.html` otherwise (it called the old `/search` path, which no longer exists as an API route after the rename below).
+- **Renamed the JSON text-search endpoint from `GET /search` to `GET /api/search`** — required, since the new `/search` page needed that exact path and FastAPI can't route two different `GET` handlers to the same path. Only one caller needed updating (search.html's own `runSearch()`), since nothing external depends on this API yet.
+
+**Verified live, each step against the actual running server:**
+- Unauthenticated `GET /ingest` (browser-style `Accept: text/html`) → `307` to `/login?next=/ingest`. Unauthenticated `GET /api/search` (API-style) → `401` JSON, no redirect leakage.
+- `POST /auth/login` with the real credentials → session cookie issued, immediately grants access to `/ingest`, `/search`, and `/admin/faiss-index/status` (real data returned, not a stub).
+- Wrong password → `401 Invalid email or password`.
+- `POST /auth/logout` → same session cookie immediately stops working (`401` on next request) — confirmed by trying it before re-logging in.
+- Static assets (`common.css`, `common.js`) confirmed reachable without auth (required — the login page itself needs to load unauthenticated), while everything else stayed gated.
+
+**Security note on record, not just in this file:** `ADMIN_PASSWORD` is stored in `.env` in plaintext — the same pattern already used for `AIRTABLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, etc. in this project. `.env` is gitignored and was never committed. If this password is reused anywhere else (e.g. the actual Gmail account's real password), that's a real risk independent of anything in this repo — worth using a dedicated, unique password for this app specifically.
+
+---
+
+## 2026-09-12 — Replaced Firestore with local SQLite; added metadata-only refresh
+
+**Status:** implemented and verified live; not yet committed/pushed.
+
+**Why the storage switch:** same reasoning that already justified swapping Vertex AI Vector Search for in-process FAISS. Firestore's actual usage here was just a durable key-value store — write one doc per ingest, read everything once at startup to rebuild FAISS, look up a handful by id per search, one simple status filter elsewhere. No complex queries. A managed cloud service bought nothing here that a local SQLite file doesn't provide for free, with less latency and zero billing surface. Trade-off, on record: this ties the data to whatever machine runs the app — fine while it runs locally, worth reconsidering (mounted volume / periodic GCS backup / back to managed) if this ever deploys to ephemeral cloud infra.
+
+**What changed:**
+- `app/metadata_store.py` rewritten against local SQLite (`local_data.db`, gitignored) — Python's `sqlite3`, stdlib, zero new dependencies. Every function kept its exact original signature, so nothing else in the codebase needed to change.
+- `app/metadata_store_firestore.py` (new) — the retired Firestore version, kept for reference and as the read side of the migration.
+- `migrate_firestore_to_sqlite.py` (new) — one-time migration script. Idempotent (safe to re-run).
+- Safety: the migration was deliberately held until a live, currently-running background ingestion job was confirmed genuinely idle (watched Firestore directly for 60+ seconds with zero new writes) — migrating mid-write, or restarting the server to load the new store, would have either produced a stale snapshot or killed the in-flight job.
+- **Verified with real data, not just synthetic tests:** migrated all 291 real documents, 0 failures; post-restart FAISS rebuild produced exact count parity (276 text / 291 image, matching pre-migration exactly); `/admin/ingest-summary` correctly reflects the migrated data.
+
+**Also added — metadata-only refresh**, for when an Airtable record's field values change but the photo doesn't:
+- `metadata_store.update_fields(doc_id, **fields)` — true partial update (unlike `save_metadata`, which replaces the whole row, faithfully matching Firestore's original `.set()` semantics).
+- `metadata_store.get_doc_ids_for_airtable_record(record_id)` — finds every doc tied to one record (a multi-image record produces multiple docs).
+- `POST /airtable/records/{record_id}/refresh-metadata` — updates `airtable_fields` to current values, and (if `text_fields` given) recombines stored `ocr_text` with the new field values and re-embeds just the text. **Never re-downloads the image, re-runs OCR, or re-embeds the image.**
+- Verified live: refreshed a real record, confirmed via SHA1 checksum that `image_embedding` was byte-for-byte unchanged, while `text_embedding`/`indexed_text` updated correctly and the live FAISS index picked it up immediately (no restart) — a real `/search` query against the new text returned the updated doc.
+
+**Also found, while investigating what's in GCS** (not a change, a finding): 411 objects in the bucket but only 291 unique `gcs_uri` values referenced by any document — ~120 orphaned objects (≈29%) from earlier re-ingests, since each re-ingest uploads a new UUID-named object rather than overwriting the previous one. Storage cost is trivial (~83MB total), but it's a real, unaddressed gap — no delete/orphan-cleanup path exists yet.
+
+---
+
 ## 2026-09-10 (later same day) — Moved image similarity search onto FAISS too
 
 **Status:** implemented, staged for testing (not yet committed/pushed).

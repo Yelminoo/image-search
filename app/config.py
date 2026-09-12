@@ -65,5 +65,13 @@ class Settings:
     # your own confirmed rate differs.
     vector_search_hourly_rate_estimate_usd: float = float(os.getenv("VECTOR_SEARCH_HOURLY_RATE_ESTIMATE_USD", "0.87"))
 
+    # Single-user login gate (see app/auth.py) — closes the "no auth on any
+    # endpoint" gap flagged since the start of this project. Deliberately
+    # simple (one hardcoded account, not a user table) since this app has
+    # exactly one operator. Set these in .env, never commit real values —
+    # .env.example only ever has placeholders.
+    admin_email: str = os.getenv("ADMIN_EMAIL", "")
+    admin_password: str = os.getenv("ADMIN_PASSWORD", "")
+
 
 settings = Settings()

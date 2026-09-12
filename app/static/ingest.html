@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ingest</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+
+<header>
+  <div class="nav-row">
+    <h1>OCR + Vector Search</h1>
+    <nav>
+      <a href="/ingest" class="active">Ingest</a>
+      <a href="/search">Search</a>
+      <button id="logout-btn" class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px;margin-top:0;">Log out</button>
+    </nav>
+  </div>
+  <p>Upload images, pull from Airtable, and review the ingest queue.</p>
+</header>
+
+<div class="cost-panel">
+  <div class="cost-card">
+    <span class="cost-dot on"></span>
+    <span class="cost-status-text">Text index: in-process (FAISS) — no deployed infra, $0</span>
+    <span class="cost-meter" id="cost-meter">—</span>
+  </div>
+</div>
+
+<main>
+
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>Ingest</h2>
+    <label class="dropzone" id="dropzone">
+      <span id="dropzone-text">Click to choose images, or drag them here (multiple allowed)</span>
+      <input type="file" id="file-input" accept="image/*" multiple>
+    </label>
+    <div class="preview" id="preview">
+      <div class="thumb-grid" id="thumb-grid"></div>
+      <div class="filename" id="preview-name"></div>
+    </div>
+    <button id="ingest-btn" disabled>Upload &amp; index</button>
+    <div class="status" id="ingest-status"></div>
+    <div class="result-text" id="ingest-text"></div>
+  </section>
+
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>Ingest from Airtable</h2>
+    <p style="font-size:12px;color:var(--muted);margin:-8px 0 12px;">
+      Pick a base and table below, then set up the two parts: which field holds the image, and which fields to index for text search.
+    </p>
+    <div class="row" style="margin-top:0;">
+      <label for="at-base-select" style="min-width:40px;">Base</label>
+      <select id="at-base-select"><option value="">Loading bases...</option></select>
+    </div>
+    <div class="row">
+      <label for="at-table-select" style="min-width:40px;">Table</label>
+      <select id="at-table-select" disabled><option value="">Pick a base first</option></select>
+    </div>
+
+    <div id="at-config-section" style="display:none;">
+      <div class="at-part">
+        <div class="at-part-title">① Image field <span>— which field holds the photo(s) to ingest</span></div>
+        <div class="row" style="margin-top:6px;">
+          <select id="at-image-field-select" style="max-width:280px;"></select>
+        </div>
+        <div id="at-preview-box" class="at-preview-box"></div>
+      </div>
+
+      <div class="at-part">
+        <div class="at-part-title">② Text fields to index <span>— combined + embedded for /search</span></div>
+        <div id="at-fields-list"></div>
+      </div>
+
+      <div class="at-part">
+        <div class="at-part-title">③ Write back to Airtable <span>— optional: write ingest results onto the source record</span></div>
+        <div id="at-writeback-rows"></div>
+      </div>
+
+      <div class="at-part">
+        <div class="at-part-title">④ Records to ingest <span>— pick which ones, or select all</span></div>
+        <div class="row" style="margin-top:6px;">
+          <button id="at-load-records-btn" class="btn-secondary" style="width:auto;padding:7px 14px;font-size:12px;">Load records</button>
+          <button id="at-select-all-btn" class="btn-secondary" style="width:auto;padding:7px 14px;font-size:12px;" disabled>Select all</button>
+          <button id="at-select-none-btn" class="btn-secondary" style="width:auto;padding:7px 14px;font-size:12px;" disabled>Select none</button>
+          <span id="at-records-summary" style="font-size:12px;color:var(--muted);"></span>
+        </div>
+        <div id="at-records-list" class="at-records-list"></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <label for="at-limit-input">Limit</label>
+      <input type="number" id="at-limit-input" placeholder="all" min="1" style="width:80px;">
+      <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);white-space:nowrap;">
+        <input type="checkbox" id="at-dryrun-checkbox"> dry run (preview only)
+      </label>
+      <button id="at-ingest-btn" style="margin-top:0;" disabled>Ingest from Airtable</button>
+    </div>
+    <div class="status" id="at-status"></div>
+    <div class="progress-outer" id="at-progress-outer" hidden>
+      <div class="progress-inner" id="at-progress-inner"></div>
+    </div>
+    <div class="progress-current" id="at-progress-current"></div>
+    <div class="result-text" id="at-result-text"></div>
+  </section>
+
+  <section class="panel" style="grid-column: 1 / -1;">
+    <h2>Pending from Airtable</h2>
+    <p style="font-size:12px;color:var(--muted);margin:-8px 0 12px;">
+      Records an Airtable Automation notified this app about. Nothing here has been ingested yet — review each one and Confirm or Dismiss.
+    </p>
+    <button id="pending-refresh-btn" class="btn-secondary" style="width:auto;padding:7px 14px;font-size:12px;">Refresh</button>
+    <div class="status" id="pending-status"></div>
+  </section>
+
+  <div class="results" id="pending-results"></div>
+
+</main>
+
+<script src="/static/common.js"></script>
+<script>
+// ---------- Ingest ----------
+const dropzone = document.getElementById("dropzone");
+const dropzoneText = document.getElementById("dropzone-text");
+const fileInput = document.getElementById("file-input");
+const preview = document.getElementById("preview");
+const thumbGrid = document.getElementById("thumb-grid");
+const previewName = document.getElementById("preview-name");
+const ingestBtn = document.getElementById("ingest-btn");
+const ingestStatus = document.getElementById("ingest-status");
+const ingestText = document.getElementById("ingest-text");
+
+let selectedFiles = [];
+
+function setSelectedFiles(fileList) {
+  const files = Array.from(fileList).filter(f => f.type.startsWith("image/"));
+  if (!files.length) return;
+  selectedFiles = files;
+
+  thumbGrid.innerHTML = files.map(f =>
+    `<div class="thumb"><img src="${URL.createObjectURL(f)}" alt=""></div>`
+  ).join("");
+  previewName.textContent = files.length === 1 ? files[0].name : `${files.length} files selected`;
+  preview.style.display = "block";
+  dropzoneText.textContent = "Choose different images";
+  ingestBtn.disabled = false;
+  ingestBtn.textContent = files.length === 1 ? "Upload & index" : `Upload & index ${files.length} images`;
+  ingestStatus.textContent = "";
+  ingestStatus.className = "status";
+  ingestText.style.display = "none";
+}
+
+fileInput.addEventListener("change", (e) => setSelectedFiles(e.target.files));
+
+dropzone.addEventListener("dragover", (e) => { e.preventDefault(); dropzone.classList.add("drag"); });
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
+dropzone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropzone.classList.remove("drag");
+  if (e.dataTransfer.files.length) setSelectedFiles(e.dataTransfer.files);
+});
+
+ingestBtn.addEventListener("click", async () => {
+  if (!selectedFiles.length) return;
+  const isBatch = selectedFiles.length > 1;
+
+  ingestBtn.disabled = true;
+  ingestStatus.textContent = isBatch
+    ? `Uploading and processing ${selectedFiles.length} images...`
+    : "Uploading and running OCR...";
+  ingestStatus.className = "status busy";
+  ingestText.style.display = "none";
+
+  const form = new FormData();
+
+  try {
+    if (isBatch) {
+      selectedFiles.forEach(f => form.append("files", f));
+      const res = await fetch(`${API_BASE}/ingest/batch`, { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+      const okCount = data.results.filter(r => r.status === "ok").length;
+      const failCount = data.results.length - okCount;
+      ingestStatus.textContent = failCount ? `${okCount} indexed, ${failCount} failed` : `${okCount} indexed`;
+      ingestStatus.className = failCount ? "status err" : "status ok";
+
+      ingestText.innerHTML = data.results.map(r => {
+        if (r.status === "ok") {
+          const badge = r.text_indexed
+            ? `<span class="badge text">text</span>`
+            : `<span class="badge novtext">no text</span>`;
+          return `<div class="batch-line">✓ ${escapeHtml(r.filename)} ${badge}</div>`;
+        }
+        return `<div class="batch-line">✗ ${escapeHtml(r.filename)} — ${escapeHtml(r.detail || "failed")}</div>`;
+      }).join("");
+      ingestText.style.display = "block";
+    } else {
+      form.append("file", selectedFiles[0]);
+      const res = await fetch(`${API_BASE}/ingest`, { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+      const badge = data.text_indexed
+        ? `<span class="badge text">text indexed</span>`
+        : `<span class="badge novtext">no text found — image search only</span>`;
+      ingestStatus.innerHTML = `Indexed as ${data.doc_id} ${badge}`;
+      ingestStatus.className = "status ok";
+      ingestText.textContent = data.ocr_text || "(no text detected)";
+      ingestText.style.display = "block";
+    }
+  } catch (err) {
+    ingestStatus.textContent = `Failed: ${err.message}`;
+    ingestStatus.className = "status err";
+  } finally {
+    ingestBtn.disabled = false;
+  }
+});
+
+// ---------- Ingest from Airtable ----------
+const atBaseSelect = document.getElementById("at-base-select");
+const atTableSelect = document.getElementById("at-table-select");
+const atConfigSection = document.getElementById("at-config-section");
+const atImageFieldSelect = document.getElementById("at-image-field-select");
+const atPreviewBox = document.getElementById("at-preview-box");
+const atFieldsList = document.getElementById("at-fields-list");
+const atWritebackRows = document.getElementById("at-writeback-rows");
+const atLoadRecordsBtn = document.getElementById("at-load-records-btn");
+const atSelectAllBtn = document.getElementById("at-select-all-btn");
+const atSelectNoneBtn = document.getElementById("at-select-none-btn");
+const atRecordsSummary = document.getElementById("at-records-summary");
+const atRecordsList = document.getElementById("at-records-list");
+const atLimitInput = document.getElementById("at-limit-input");
+const atDryRunCheckbox = document.getElementById("at-dryrun-checkbox");
+const atIngestBtn = document.getElementById("at-ingest-btn");
+const atStatus = document.getElementById("at-status");
+const atResultText = document.getElementById("at-result-text");
+
+let atTablesCache = [];
+let atRecordsCache = [];
+
+async function loadAirtableBases() {
+  try {
+    const res = await fetch(`${API_BASE}/airtable/bases`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    if (!data.bases.length) {
+      atBaseSelect.innerHTML = `<option value="">No bases found</option>`;
+      return;
+    }
+    atBaseSelect.innerHTML = data.bases.map(b => `<option value="${b.id}">${escapeHtml(b.name)}</option>`).join("");
+    const saved = localStorage.getItem("at_base_id");
+    if (saved && data.bases.some(b => b.id === saved)) atBaseSelect.value = saved;
+    await loadAirtableTables();
+  } catch (err) {
+    atBaseSelect.innerHTML = `<option value="">Failed: ${escapeHtml(err.message)}</option>`;
+  }
+}
+
+async function loadAirtableTables() {
+  const baseId = atBaseSelect.value;
+  if (!baseId) return;
+  localStorage.setItem("at_base_id", baseId);
+  atTableSelect.disabled = true;
+  atTableSelect.innerHTML = `<option value="">Loading tables...</option>`;
+  atConfigSection.style.display = "none";
+  atIngestBtn.disabled = true;
+
+  try {
+    const res = await fetch(`${API_BASE}/airtable/bases/${encodeURIComponent(baseId)}/tables`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    atTablesCache = data.tables;
+    atTableSelect.innerHTML = data.tables.map(t => `<option value="${escapeHtml(t.name)}">${escapeHtml(t.name)}</option>`).join("");
+    atTableSelect.disabled = false;
+    const saved = localStorage.getItem("at_table_name_" + baseId);
+    if (saved && data.tables.some(t => t.name === saved)) atTableSelect.value = saved;
+    renderAirtableConfig();
+  } catch (err) {
+    atTableSelect.innerHTML = `<option value="">Failed: ${escapeHtml(err.message)}</option>`;
+  }
+}
+
+function renderAirtableConfig() {
+  const tableName = atTableSelect.value;
+  const table = atTablesCache.find(t => t.name === tableName);
+  if (!table) { atConfigSection.style.display = "none"; atIngestBtn.disabled = true; return; }
+
+  localStorage.setItem("at_table_name_" + atBaseSelect.value, tableName);
+
+  const textFields = table.fields.filter(f => !f.isAttachment);
+  const imageFields = table.fields.filter(f => f.isAttachment);
+
+  // --- Part 1: image field ---
+  if (!imageFields.length) {
+    atImageFieldSelect.innerHTML = `<option value="">No attachment field in this table</option>`;
+    atPreviewBox.innerHTML = `<div style="font-size:12px;color:var(--danger);">This table has no attachment-type field — nothing to ingest from it.</div>`;
+    atIngestBtn.disabled = true;
+  } else {
+    atImageFieldSelect.innerHTML = imageFields.map(f => `<option value="${escapeHtml(f.name)}">${escapeHtml(f.name)}</option>`).join("");
+    const savedImgField = localStorage.getItem("at_image_field_" + atBaseSelect.value + "_" + tableName);
+    if (savedImgField && imageFields.some(f => f.name === savedImgField)) atImageFieldSelect.value = savedImgField;
+    atIngestBtn.disabled = false;
+    loadAirtablePreview();
+  }
+
+  // --- Part 2: text fields to index ---
+  const savedRaw = localStorage.getItem("at_text_fields_" + atBaseSelect.value + "_" + tableName);
+  const saved = savedRaw ? JSON.parse(savedRaw) : [];
+  atFieldsList.innerHTML = textFields.length
+    ? textFields.map(f => `
+        <label>
+          <input type="checkbox" class="at-field-checkbox" value="${escapeHtml(f.name)}" ${saved.includes(f.name) ? "checked" : ""}>
+          ${escapeHtml(f.name)} <span style="color:var(--muted);font-size:11px;">(${escapeHtml(f.type)})</span>
+        </label>
+      `).join("")
+    : `<div style="font-size:12px;color:var(--muted);">No other fields on this table.</div>`;
+
+  // --- Part 3: write-back to Airtable ---
+  renderWriteBackRows(table);
+
+  // --- Part 4: records to ingest --- (stale list from a previous table shouldn't linger; require an explicit reload)
+  atRecordsCache = [];
+  atRecordsList.innerHTML = "";
+  atRecordsSummary.textContent = "";
+  atSelectAllBtn.disabled = true;
+  atSelectNoneBtn.disabled = true;
+
+  atConfigSection.style.display = "block";
+}
+
+async function loadAirtableRecordsList() {
+  const baseId = atBaseSelect.value;
+  const tableName = atTableSelect.value;
+  if (!baseId || !tableName) return;
+
+  atLoadRecordsBtn.disabled = true;
+  atRecordsSummary.textContent = "Loading records...";
+  atRecordsList.innerHTML = "";
+
+  // Use the Doc ID write-back field (if enabled + pointing at an existing
+  // field, not "+ Create new") to detect which records look already ingested.
+  let docIdField = "";
+  const docIdRow = atWritebackRows.querySelector('.at-wb-row[data-key="doc_id"]');
+  if (docIdRow && docIdRow.querySelector(".at-wb-enabled").checked) {
+    const sel = docIdRow.querySelector(".at-wb-select").value;
+    if (sel && sel !== "__create__") docIdField = sel;
+  }
+
+  const params = new URLSearchParams();
+  if (atImageFieldSelect.value) params.set("image_field", atImageFieldSelect.value);
+  if (docIdField) params.set("doc_id_field", docIdField);
+
+  try {
+    const res = await fetch(`${API_BASE}/airtable/bases/${encodeURIComponent(baseId)}/tables/${encodeURIComponent(tableName)}/records?${params.toString()}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    atRecordsCache = data.records;
+    renderAirtableRecordsList();
+    atSelectAllBtn.disabled = false;
+    atSelectNoneBtn.disabled = false;
+
+    const alreadyCount = data.records.filter(r => r.already_ingested).length;
+    atRecordsSummary.textContent = `${data.records.length} record(s)${data.truncated ? " (truncated)" : ""} — ${alreadyCount} already ingested, ${data.records.length - alreadyCount} pre-selected` +
+      (docIdField ? "" : " (enable + pick an existing Doc ID field in ③ to detect already-ingested records)");
+  } catch (err) {
+    atRecordsSummary.textContent = `Failed: ${err.message}`;
+  } finally {
+    atLoadRecordsBtn.disabled = false;
+  }
+}
+
+function renderAirtableRecordsList() {
+  if (!atRecordsCache.length) {
+    atRecordsList.innerHTML = `<div style="padding:10px;font-size:12px;color:var(--muted);">No records in this table.</div>`;
+    return;
+  }
+  atRecordsList.innerHTML = atRecordsCache.map(r => {
+    const previewText = Object.entries(r.preview).map(([k, v]) => `${k}: ${formatFieldValue(v)}`).join(" · ");
+    const badge = r.already_ingested ? ' <span class="badge novtext">already ingested</span>' : "";
+    return `
+      <label class="at-record-row ${r.already_ingested ? "already-ingested" : ""}">
+        <input type="checkbox" class="at-record-checkbox" value="${escapeHtml(r.record_id)}" ${r.already_ingested ? "" : "checked"}>
+        <img src="${r.thumbnail_url || ""}" alt="" onerror="this.style.visibility='hidden'">
+        <span class="at-record-text">${escapeHtml(previewText) || "(no other fields)"}${badge}</span>
+      </label>`;
+  }).join("");
+}
+
+atLoadRecordsBtn.addEventListener("click", loadAirtableRecordsList);
+atSelectAllBtn.addEventListener("click", () => {
+  atRecordsList.querySelectorAll(".at-record-checkbox").forEach(cb => cb.checked = true);
+});
+atSelectNoneBtn.addEventListener("click", () => {
+  atRecordsList.querySelectorAll(".at-record-checkbox").forEach(cb => cb.checked = false);
+});
+
+const WRITE_BACK_ITEMS = [
+  { key: "doc_id", label: "Doc ID", kind: "text" },
+  { key: "indexed", label: "Indexed flag", kind: "checkbox" },
+  { key: "ocr_text", label: "Search text", kind: "long_text" },
+];
+const WRITE_BACK_PARAM_NAMES = { doc_id: "write_doc_id_field", indexed: "write_indexed_field", ocr_text: "write_text_field" };
+
+function renderWriteBackRows(table) {
+  const candidateFields = table.fields.filter(f => !f.isAttachment);
+  const savedRaw = localStorage.getItem("at_writeback_" + atBaseSelect.value + "_" + atTableSelect.value);
+  const saved = savedRaw ? JSON.parse(savedRaw) : {};
+
+  atWritebackRows.innerHTML = WRITE_BACK_ITEMS.map(item => {
+    const s = saved[item.key] || {};
+    const enabled = !!s.enabled;
+    const isCreate = s.field === "__create__";
+    const fieldOptions = candidateFields.map(f =>
+      `<option value="${escapeHtml(f.name)}" ${s.field === f.name ? "selected" : ""}>${escapeHtml(f.name)}</option>`
+    ).join("");
+    return `
+      <div class="at-wb-row" data-key="${item.key}" data-kind="${item.kind}">
+        <label class="at-wb-enable">
+          <input type="checkbox" class="at-wb-enabled" ${enabled ? "checked" : ""}>
+          ${escapeHtml(item.label)}
+        </label>
+        <select class="at-wb-select" ${enabled ? "" : "disabled"}>
+          <option value="">(choose a field)</option>
+          ${fieldOptions}
+          <option value="__create__" ${isCreate ? "selected" : ""}>+ Create new field...</option>
+        </select>
+        <input type="text" class="at-wb-newname" placeholder="New field name"
+               style="display:${isCreate ? "inline-block" : "none"};"
+               value="${s.newName ? escapeHtml(s.newName) : ""}">
+      </div>`;
+  }).join("");
+
+  atWritebackRows.querySelectorAll(".at-wb-row").forEach(row => {
+    const enabledCb = row.querySelector(".at-wb-enabled");
+    const select = row.querySelector(".at-wb-select");
+    const newNameInput = row.querySelector(".at-wb-newname");
+
+    enabledCb.addEventListener("change", () => {
+      select.disabled = !enabledCb.checked;
+      saveWriteBackState();
+    });
+    select.addEventListener("change", () => {
+      newNameInput.style.display = select.value === "__create__" ? "inline-block" : "none";
+      saveWriteBackState();
+    });
+    newNameInput.addEventListener("input", saveWriteBackState);
+  });
+}
+
+function saveWriteBackState() {
+  const state = {};
+  atWritebackRows.querySelectorAll(".at-wb-row").forEach(row => {
+    state[row.dataset.key] = {
+      enabled: row.querySelector(".at-wb-enabled").checked,
+      field: row.querySelector(".at-wb-select").value,
+      newName: row.querySelector(".at-wb-newname").value,
+    };
+  });
+  localStorage.setItem("at_writeback_" + atBaseSelect.value + "_" + atTableSelect.value, JSON.stringify(state));
+}
+
+// Resolves the write-back UI state into query-param values for /ingest/airtable,
+// creating any "+ Create new field" entries in Airtable first (awaited, so the
+// ingest call itself always references a field name that already exists by
+// the time it starts). Throws if a row is enabled but incompletely configured.
+async function resolveWriteBackParams() {
+  const table = atTablesCache.find(t => t.name === atTableSelect.value);
+  const result = {};
+
+  for (const row of atWritebackRows.querySelectorAll(".at-wb-row")) {
+    const key = row.dataset.key;
+    const kind = row.dataset.kind;
+    const paramName = WRITE_BACK_PARAM_NAMES[key];
+    const enabled = row.querySelector(".at-wb-enabled").checked;
+
+    if (!enabled) { result[paramName] = ""; continue; }
+
+    const selectVal = row.querySelector(".at-wb-select").value;
+    if (selectVal === "__create__") {
+      const newName = row.querySelector(".at-wb-newname").value.trim();
+      if (!newName) throw new Error(`Enter a name for the new "${key}" field, or uncheck it`);
+      const res = await fetch(
+        `${API_BASE}/airtable/bases/${encodeURIComponent(atBaseSelect.value)}/tables/${encodeURIComponent(table.id)}/fields`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: newName, kind }) },
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(`Creating field "${newName}" failed: ${data.detail || res.status}`);
+      result[paramName] = data.name;
+    } else if (selectVal) {
+      result[paramName] = selectVal;
+    } else {
+      throw new Error(`Pick a field for "${key}" (or uncheck it to skip write-back for that item)`);
+    }
+  }
+  return result;
+}
+
+async function loadAirtablePreview() {
+  const baseId = atBaseSelect.value;
+  const tableName = atTableSelect.value;
+  atPreviewBox.innerHTML = `<div style="font-size:12px;color:var(--muted);">Loading preview...</div>`;
+  try {
+    const res = await fetch(`${API_BASE}/airtable/bases/${encodeURIComponent(baseId)}/tables/${encodeURIComponent(tableName)}/sample`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    if (!data.record_id) {
+      atPreviewBox.innerHTML = `<div style="font-size:12px;color:var(--muted);">Table has no records yet — nothing to preview.</div>`;
+      return;
+    }
+
+    const imgField = atImageFieldSelect.value;
+    const urls = data.image_previews[imgField] || [];
+    const thumbs = urls.length
+      ? `<div class="at-thumbs">${urls.map(u => `<img src="${u}" alt="" onerror="this.style.visibility='hidden'">`).join("")}</div>`
+      : `<div style="font-size:12px;color:var(--danger);">Sample record has no image in "${escapeHtml(imgField)}" — field may be empty on this row, try ingesting to confirm.</div>`;
+
+    atPreviewBox.innerHTML = thumbs + renderFieldsPreview(data.fields);
+  } catch (err) {
+    atPreviewBox.innerHTML = `<div style="font-size:12px;color:var(--danger);">Preview failed: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+atBaseSelect.addEventListener("change", loadAirtableTables);
+atTableSelect.addEventListener("change", renderAirtableConfig);
+atImageFieldSelect.addEventListener("change", () => {
+  localStorage.setItem("at_image_field_" + atBaseSelect.value + "_" + atTableSelect.value, atImageFieldSelect.value);
+  loadAirtablePreview();
+});
+
+const atProgressOuter = document.getElementById("at-progress-outer");
+const atProgressInner = document.getElementById("at-progress-inner");
+const atProgressCurrent = document.getElementById("at-progress-current");
+let atPollTimer = null;
+
+function renderAirtableResultLines(results) {
+  return results.map(r => {
+    const mark = r.status === "ok" ? "✓" : r.status === "dry_run" ? "•" : "✗";
+    const label = r.status === "ok"
+      ? `${escapeHtml(r.filename)} ${r.text_indexed ? '<span class="badge text">text</span>' : '<span class="badge novtext">no text</span>'}`
+      : `${escapeHtml(r.filename)} — ${escapeHtml(r.detail || r.status)}`;
+    return `<div class="batch-line">${mark} ${label}</div>`;
+  }).join("");
+}
+
+atIngestBtn.addEventListener("click", async () => {
+  const baseId = atBaseSelect.value;
+  const tableName = atTableSelect.value;
+  if (!baseId || !tableName) return;
+
+  const selectedFields = Array.from(document.querySelectorAll(".at-field-checkbox:checked")).map(cb => cb.value);
+  localStorage.setItem("at_text_fields_" + baseId + "_" + tableName, JSON.stringify(selectedFields));
+
+  const dryRun = atDryRunCheckbox.checked;
+  const limit = atLimitInput.value;
+
+  atIngestBtn.disabled = true;
+  atStatus.textContent = dryRun ? "Previewing..." : "Starting ingest...";
+  atStatus.className = "status busy";
+  atResultText.style.display = "none";
+  atProgressOuter.hidden = true;
+  atProgressCurrent.textContent = "";
+  if (atPollTimer) { clearInterval(atPollTimer); atPollTimer = null; }
+
+  const params = new URLSearchParams();
+  params.set("base", baseId);
+  params.set("table", tableName);
+  if (limit) params.set("limit", limit);
+  if (dryRun) params.set("dry_run", "true");
+  if (atImageFieldSelect.value) params.set("image_field", atImageFieldSelect.value);
+  selectedFields.forEach(f => params.append("text_fields", f));
+
+  // If records were loaded in Part ④, ingest exactly the checked ones
+  // instead of scanning the whole table (record_ids overrides limit on
+  // the backend). Already-ingested records come pre-unchecked, so leaving
+  // them alone is enough to skip them -- no separate "skip" step needed.
+  if (atRecordsCache.length) {
+    const checkedIds = Array.from(atRecordsList.querySelectorAll(".at-record-checkbox:checked")).map(cb => cb.value);
+    if (!checkedIds.length) {
+      atStatus.textContent = "No records selected in ④ Records to ingest — check at least one, or click Select all.";
+      atStatus.className = "status err";
+      atIngestBtn.disabled = false;
+      return;
+    }
+    checkedIds.forEach(id => params.append("record_ids", id));
+  }
+
+  // Dry runs never write back (nothing was actually ingested to write
+  // about) -- skip resolving write-back fields so a "preview only" click
+  // can't have the side effect of creating a field in Airtable.
+  if (!dryRun) {
+    try {
+      const writeBackParams = await resolveWriteBackParams();
+      Object.entries(writeBackParams).forEach(([k, v]) => params.set(k, v));
+    } catch (err) {
+      atStatus.textContent = `Failed: ${err.message}`;
+      atStatus.className = "status err";
+      atIngestBtn.disabled = false;
+      return;
+    }
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/ingest/airtable?${params.toString()}`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    if (dryRun) {
+      // Synchronous response, same shape as before -- no job/polling involved.
+      const dryCount = data.results.filter(r => r.status === "dry_run").length;
+      atStatus.textContent = `${data.records_scanned} record(s) scanned, ${data.images_found} image(s) found, ${dryCount} would be ingested (dry run)`;
+      atStatus.className = "status ok";
+      atResultText.innerHTML = renderAirtableResultLines(data.results);
+      atResultText.style.display = "block";
+      atIngestBtn.disabled = false;
+      return;
+    }
+
+    // Real ingest: server already kicked off a background job and returned
+    // immediately (see /ingest/airtable's docstring) -- poll for progress.
+    // This polling is purely observational: closing the tab, or this
+    // request failing, does NOT stop or affect the ingestion running
+    // server-side.
+    atProgressOuter.hidden = false;
+    pollAirtableIngestJob(data.job_id);
+  } catch (err) {
+    atStatus.textContent = `Failed: ${err.message}`;
+    atStatus.className = "status err";
+    atIngestBtn.disabled = false;
+  }
+});
+
+function pollAirtableIngestJob(jobId) {
+  atPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/ingest/airtable/jobs/${jobId}`);
+      const job = await res.json();
+      if (!res.ok) throw new Error(job.detail || `HTTP ${res.status}`);
+      renderAirtableJobProgress(job);
+
+      if (job.status === "done" || job.status === "error") {
+        clearInterval(atPollTimer);
+        atPollTimer = null;
+        atIngestBtn.disabled = false;
+        if (job.status === "done") refreshIndexStatus();
+      }
+    } catch (err) {
+      clearInterval(atPollTimer);
+      atPollTimer = null;
+      atStatus.textContent = `Lost track of the job: ${err.message} (the ingest itself may still be running server-side)`;
+      atStatus.className = "status err";
+      atIngestBtn.disabled = false;
+    }
+  }, 1000);
+}
+
+function renderAirtableJobProgress(job) {
+  const okCount = job.results.filter(r => r.status === "ok").length;
+  const failCount = job.results.length - okCount;
+
+  if (job.status === "running") {
+    atStatus.textContent = `Running: ${job.records_scanned} record(s) scanned, ${job.images_done}/${job.images_found} image(s) processed`;
+    atStatus.className = "status busy";
+    atProgressCurrent.textContent = job.current || "";
+    if (job.images_found > 0) {
+      atProgressInner.classList.remove("indeterminate");
+      atProgressInner.style.width = `${Math.min(100, Math.round((job.images_done / job.images_found) * 100))}%`;
+    } else {
+      // Nothing found yet to compute a real percentage against (still scanning records) -- show motion, not a stalled 0% bar.
+      atProgressInner.classList.add("indeterminate");
+    }
+  } else if (job.status === "done") {
+    atProgressInner.classList.remove("indeterminate");
+    atProgressInner.style.width = "100%";
+    atProgressCurrent.textContent = "";
+    atStatus.textContent = `Done: ${job.records_scanned} record(s) scanned, ${okCount} ingested${failCount ? `, ${failCount} failed` : ""}`;
+    atStatus.className = failCount ? "status err" : "status ok";
+  } else {
+    atProgressCurrent.textContent = "";
+    atStatus.textContent = `Job failed: ${job.error || "unknown error"}`;
+    atStatus.className = "status err";
+  }
+
+  atResultText.innerHTML = renderAirtableResultLines(job.results);
+  atResultText.style.display = job.results.length ? "block" : "none";
+}
+
+loadAirtableBases();
+
+// ---------- Pending from Airtable ----------
+const pendingResultsEl = document.getElementById("pending-results");
+const pendingStatus = document.getElementById("pending-status");
+const pendingRefreshBtn = document.getElementById("pending-refresh-btn");
+
+async function loadPending() {
+  pendingStatus.textContent = "Loading...";
+  pendingStatus.className = "status busy";
+  try {
+    const res = await fetch(`${API_BASE}/airtable/pending`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+
+    pendingStatus.textContent = data.items.length ? "" : "Nothing pending.";
+    pendingStatus.className = "status";
+    renderPending(data.items);
+  } catch (err) {
+    pendingStatus.textContent = `Failed: ${err.message}`;
+    pendingStatus.className = "status err";
+  }
+}
+
+function renderPending(items) {
+  if (!items.length) {
+    pendingResultsEl.innerHTML = "";
+    return;
+  }
+  pendingResultsEl.innerHTML = items.map(item => {
+    if (item.fetch_error) {
+      return `
+        <div class="result-card pending-card">
+          <div class="body">
+            <div class="meta"><span>${escapeHtml(item.record_id)} &middot; ${escapeHtml(item.table)}</span></div>
+            <div class="text">Could not fetch preview: ${escapeHtml(item.fetch_error)}</div>
+            <div class="actions">
+              <button class="btn-confirm" onclick="confirmPending('${item.record_id}')">Confirm anyway</button>
+              <button class="btn-secondary" onclick="dismissPending('${item.record_id}')">Dismiss</button>
+            </div>
+          </div>
+        </div>`;
+    }
+    return `
+      <div class="result-card pending-card">
+        <img src="${item.preview_image_url || ''}" alt="" onerror="this.style.visibility='hidden'">
+        <div class="body">
+          <div class="meta"><span>${escapeHtml(item.record_id)} &middot; ${escapeHtml(item.table)}</span></div>
+          ${renderFieldsPreview(item.preview_fields) || '<div class="fields-preview">(no other fields)</div>'}
+          <div class="actions">
+            <button class="btn-confirm" onclick="confirmPending('${item.record_id}')">Confirm &amp; ingest</button>
+            <button class="btn-secondary" onclick="dismissPending('${item.record_id}')">Dismiss</button>
+          </div>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+async function confirmPending(recordId) {
+  pendingStatus.textContent = `Ingesting ${recordId}...`;
+  pendingStatus.className = "status busy";
+  try {
+    const res = await fetch(`${API_BASE}/airtable/pending/${encodeURIComponent(recordId)}/confirm`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    pendingStatus.textContent = `Ingested ${recordId}.`;
+    pendingStatus.className = "status ok";
+  } catch (err) {
+    pendingStatus.textContent = `Failed: ${err.message}`;
+    pendingStatus.className = "status err";
+  } finally {
+    loadPending();
+  }
+}
+
+async function dismissPending(recordId) {
+  try {
+    const res = await fetch(`${API_BASE}/airtable/pending/${encodeURIComponent(recordId)}/dismiss`, { method: "POST" });
+    if (!res.ok) { const data = await res.json(); throw new Error(data.detail || `HTTP ${res.status}`); }
+  } catch (err) {
+    alert(`Failed: ${err.message}`);
+  } finally {
+    loadPending();
+  }
+}
+
+pendingRefreshBtn.addEventListener("click", loadPending);
+loadPending();
+setInterval(loadPending, 30000);
+</script>
+
+</body>
+</html>
